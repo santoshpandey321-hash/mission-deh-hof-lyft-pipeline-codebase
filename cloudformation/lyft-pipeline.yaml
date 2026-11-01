@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  DEH HOF Lyft NYCTLC Pipeline. Provisions the SNS alert topic, three Glue jobs
+  (ingestion, raw-to-curated, curated-to-aggregated), the Step Functions state
+  machine that orchestrates them, and the Lambda function that starts the state
+  machine on S3 file arrival. IAM roles and the S3 bucket are pre-provisioned by
+  the Cloud Infra team and passed in as parameters.
+
+# ---------------------------------------------------------------------------
+# Parameters - pre-existing resources (owned by Cloud Infra team) + config
+# ---------------------------------------------------------------------------
+Parameters:
+
+  GlueRoleArn:
+    Type: String
+    Default: arn:aws:iam::030798167757:role/mission-deh-hof-glue-role
+    Description: Pre-existing IAM role assumed by the Glue jobs.
+
+  LambdaRoleArn:
+    Type: String
+    Default: arn:aws:iam::030798167757:role/mission-deh-hof-lambda-trigger-role
+    Description: Pre-existing IAM role assumed by the trigger Lambda.
+
+  StepFunctionsRoleArn:
+    Type: String
+    Default: arn:aws:iam::030798167757:role/mission-deh-hof-stepfunctions-role
+    Description: Pre-existing IAM role assumed by the Step Functions state machine.
+
+  AlertEmailAddress:
+    Type: String
+    Default: connect@dataengineeringhub.in
+    Description: >
+      Email address subscribed to the pipeline alerts SNS topic. The subscription
+      must be confirmed via the link sent to this address before alerts arrive.
+
+  DataBucketName:
+    Type: String
+    Default: mission-deh-hof-nyctlc-030798167757
+    Description: >
+      Pre-existing S3 bucket that stores raw/curated/aggregated data and the
+      Glue job scripts (under the scripts/ prefix).
+
+  IngestionScriptKey:
+    Type: String
+    Default: scripts/backup-nyctlc-ingestion.py
+    Description: S3 key of the ingestion (Python Shell) Glue script.
+
+  RawToCuratedScriptKey:
+    Type: String
+    Default: scripts/backup-raw-to-curated.py
+    Description: S3 key of the raw-to-curated (Spark) Glue script.
+
+  CuratedToAggregatedScriptKey:
+    Type: String
+    Default: scripts/backup-curated-to-aggregated.py
+    Description: S3 key of the curated-to-aggregated (Spark) Glue script.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # --- SNS: pipeline alerts topic -----------------------------------------
+  PipelineAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: mission-deh-hof-pipeline-alerts
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmailAddress
+
+  # --- Glue job 1: NYCTLC ingestion (Python Shell) ------------------------
+  NyctlcIngestionJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: mission-deh-hof-nyctlc-ingestion
+      Role: !Ref GlueRoleArn
+      GlueVersion: "3.0"
+      MaxCapacity: 0.0625
+      Timeout: 30
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: pythonshell
+        PythonVersion: "3.9"
+        ScriptLocation: !Sub "s3://${DataBucketName}/${IngestionScriptKey}"
+
+  # --- Glue job 2: raw -> curated (Spark ETL) -----------------------------
+  RawToCuratedJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: mission-deh-hof-raw-to-curated-etl
+      Role: !Ref GlueRoleArn
+      GlueVersion: "5.1"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataBucketName}/${RawToCuratedScriptKey}"
+
+  # --- Glue job 3: curated -> aggregated (Spark ETL) ----------------------
+  CuratedToAggregatedJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: mission-deh-hof-curated-to-aggregated-etl
+      Role: !Ref GlueRoleArn
+      GlueVersion: "5.1"
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Sub "s3://${DataBucketName}/${CuratedToAggregatedScriptKey}"
+
+  # --- Step Functions: orchestration state machine ------------------------
+  LyftPipelineStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn:
+      - NyctlcIngestionJob
+      - RawToCuratedJob
+      - CuratedToAggregatedJob
+      - PipelineAlertsTopic
+    Properties:
+      StateMachineName: mission-deh-hof-lyft-pipeline
+      StateMachineType: STANDARD
+      RoleArn: !Ref StepFunctionsRoleArn
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "Lyft NYCTLC Data Pipeline - Orchestrated by Step Functions",
+            "StartAt": "RunIngestion",
+            "States": {
+              "RunIngestion": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {"JobName": "${IngestionJobName}"},
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+                "Next": "RunRawToCurated"
+              },
+              "RunRawToCurated": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {"JobName": "${RawToCuratedJobName}"},
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+                "Next": "RunCuratedToAggregated"
+              },
+              "RunCuratedToAggregated": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::glue:startJobRun.sync",
+                "Parameters": {"JobName": "${CuratedToAggregatedJobName}"},
+                "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure"}],
+                "Next": "NotifySuccess"
+              },
+              "NotifySuccess": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${AlertsTopicArn}",
+                  "Subject": "\u2705 Lyft Pipeline Complete - Data Available",
+                  "Message": "Pipeline complete. All jobs finished successfully."
+                },
+                "Next": "PipelineSucceeded"
+              },
+              "PipelineSucceeded": {"Type": "Succeed"},
+              "NotifyFailure": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${AlertsTopicArn}",
+                  "Subject": "\u274C Lyft Pipeline FAILED",
+                  "Message.$": "States.Format('Pipeline failed. Error: {}', $.error.Cause)"
+                },
+                "Next": "PipelineFailed"
+              },
+              "PipelineFailed": {"Type": "Fail", "Error": "PipelineExecutionFailed", "Cause": "One or more Glue jobs failed."}
+            }
+          }
+        - IngestionJobName: !Ref NyctlcIngestionJob
+          RawToCuratedJobName: !Ref RawToCuratedJob
+          CuratedToAggregatedJobName: !Ref CuratedToAggregatedJob
+          AlertsTopicArn: !Ref PipelineAlertsTopic
+
+  # --- Lambda: S3-triggered pipeline starter ------------------------------
+  PipelineTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: mission-deh-hof-pipeline-trigger
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !Ref LambdaRoleArn
+      Timeout: 30
+      MemorySize: 128
+      Architectures:
+        - x86_64
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+
+          def lambda_handler(event, context):
+              sfn = boto3.client('stepfunctions')
+              state_machine_arn = os.environ['STATE_MACHINE_ARN']
+
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  print(f"New file detected: s3://{bucket}/{key}")
+
+              response = sfn.start_execution(
+                  stateMachineArn=state_machine_arn,
+                  input=json.dumps({"trigger": "s3_event", "source_file": key})
+              )
+
+              print(f"Started Step Function execution: {response['executionArn']}")
+              return {"statusCode": 200, "executionArn": response['executionArn']}
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref LyftPipelineStateMachine
+
+  # --- Allow S3 to invoke the Lambda (event notification wiring) ----------
+  # NOTE: The S3 bucket is pre-existing and NOT managed by this stack, so the
+  # bucket-side notification config must be added separately (see Outputs note).
+  # This permission grants S3 the right to invoke the function once that
+  # notification is configured.
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PipelineTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !Sub "arn:aws:s3:::${DataBucketName}"
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  StateMachineArn:
+    Description: ARN of the Lyft pipeline state machine.
+    Value: !Ref LyftPipelineStateMachine
+
+  AlertsTopicArn:
+    Description: ARN of the SNS alerts topic. Add subscriptions (email/etc.) as needed.
+    Value: !Ref PipelineAlertsTopic
+
+  TriggerFunctionArn:
+    Description: ARN of the S3-triggered pipeline Lambda.
+    Value: !GetAtt PipelineTriggerFunction.Arn
+
+  S3NotificationNote:
+    Description: Manual step required for the event-driven trigger.
+    Value: !Sub >-
+      Configure an S3 event notification on bucket ${DataBucketName} (scoped to a
+      landing prefix, NOT the raw/ prefix, to avoid re-trigger loops) targeting
+      the mission-deh-hof-pipeline-trigger Lambda. This must be done on the
+      bucket, which is not managed by this stack.
