@@ -33,7 +33,7 @@ from awsglue.context import GlueContext
 from awsglue.job import Job
 from pyspark.sql.functions import (
     col, hour, dayofweek, date_format, to_date,
-    round as spark_round, when, lit, unix_timestamp
+    round as spark_round, when, lit, unix_timestamp , broadcast
 )
 import boto3
 import time
@@ -207,7 +207,7 @@ try:
         col("service_zone").alias("pickup_service_zone")
     )
 
-    trip_df = trip_df.join(pickup_zone, on="PULocationID", how="left")
+    trip_df = trip_df.join(broadcast(pickup_zone), on="PULocationID", how="left")
 
     # Dropoff zone join
     dropoff_zone = zone_df.select(
