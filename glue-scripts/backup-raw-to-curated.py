@@ -207,7 +207,7 @@ try:
         col("service_zone").alias("pickup_service_zone")
     )
 
-    trip_df = trip_df.join(pickup_zone, on="PULocationID", how="left")
+    trip_df = trip_df.join(pickup_zone.hint("broadcast"), on="PULocationID", how="left")
 
     # Dropoff zone join
     dropoff_zone = zone_df.select(
